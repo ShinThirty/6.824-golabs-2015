@@ -1,18 +1,19 @@
 package pbservice
 
-import "net"
-import "fmt"
-import "net/rpc"
-import "log"
-import "time"
-import "viewservice"
-import "sync"
-import "sync/atomic"
-import "os"
-import "syscall"
-import "math/rand"
+import (
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"net/rpc"
+	"os"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
-
+	"6.824/viewservice"
+)
 
 type PBServer struct {
 	mu         sync.Mutex
@@ -21,36 +22,191 @@ type PBServer struct {
 	unreliable int32 // for testing
 	me         string
 	vs         *viewservice.Clerk
-	// Your declarations here.
-}
 
+	activeView                       viewservice.View
+	data                             map[string]string
+	highestHandledRequestIDByClerkID map[int64]int64
+	pr                               *Clerk // Primary will use this clerk to sync data and forward requests to the backup
+}
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
 
-	// Your code here.
+	if args.Viewnum != pb.activeView.Viewnum {
+		reply.Err = ErrWrongViewnum
+		return nil
+	}
 
+	if pb.me != pb.activeView.Primary {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	value, ok := pb.data[args.Key]
+	if !ok {
+		reply.Err = ErrNoKey
+		return nil
+	}
+
+	reply.Value = value
+	reply.Err = OK
 	return nil
 }
-
 
 func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
 
-	// Your code here.
+	if args.RequestID <= pb.highestHandledRequestIDByClerkID[args.ClerkID] {
+		reply.Err = OK
+		return nil
+	}
 
+	log.Printf("Args %v, activeView: %v", *args, pb.activeView)
+	if args.Viewnum != pb.activeView.Viewnum {
+		reply.Err = ErrWrongViewnum
+		return nil
+	}
 
+	if pb.me != pb.activeView.Primary {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	err := pb.mayForwardPutAppend(args)
+	if err != OK {
+		reply.Err = err
+		return nil
+	}
+
+	pb.doPutAppend(args)
+	pb.highestHandledRequestIDByClerkID[args.ClerkID] = args.RequestID
+	reply.Err = OK
 	return nil
 }
 
+func (pb *PBServer) doPutAppend(args *PutAppendArgs) {
+	log.Printf("Do PutAppend: %v", *args)
+	switch args.Op {
+	case Put:
+		pb.data[args.Key] = args.Value
+	case Append:
+		oldValue, ok := pb.data[args.Key]
+		if !ok {
+			oldValue = ""
+		}
+		pb.data[args.Key] = oldValue + args.Value
+	}
+}
 
-//
+func (pb *PBServer) ForwardPutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	log.Printf("Received forwarded PutAppend %v", *args)
+	if args.RequestID <= pb.highestHandledRequestIDByClerkID[args.ClerkID] {
+		reply.Err = OK
+		return nil
+	}
+
+	if args.Viewnum != pb.activeView.Viewnum {
+		reply.Err = ErrWrongViewnum
+		return nil
+	}
+
+	if pb.me != pb.activeView.Backup {
+		reply.Err = ErrWrongViewnum
+		return nil
+	}
+
+	pb.doPutAppend(args)
+	pb.highestHandledRequestIDByClerkID[args.ClerkID] = args.RequestID
+	reply.Err = OK
+	return nil
+}
+
+func (pb *PBServer) mayForwardPutAppend(args *PutAppendArgs) Err {
+	if pb.pr == nil {
+		return OK
+	} else {
+		reply := pb.pr.ForwardPutAppend(args)
+		return reply.Err
+	}
+}
+
+func (pb *PBServer) Sync(args *SyncArgs, reply *SyncReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if args.Viewnum < pb.activeView.Viewnum {
+		// outdated requests and should be ignored and not retried
+		reply.Err = OK
+		return nil
+	}
+
+	if args.Viewnum > pb.activeView.Viewnum {
+		// more up-to-date requests and should be retried
+		reply.Err = ErrWrongViewnum
+		return nil
+	}
+
+	for k, v := range args.Data {
+		pb.data[k] = v
+	}
+	for k, v := range args.HighestHandledRequestIDByClerkID {
+		pb.highestHandledRequestIDByClerkID[k] = v
+	}
+	reply.Err = OK
+	return nil
+}
+
 // ping the viewserver periodically.
 // if view changed:
-//   transition to new view.
-//   manage transfer of state from primary to new backup.
 //
+//	transition to new view.
+//	manage transfer of state from primary to new backup.
 func (pb *PBServer) tick() {
+	pb.mu.Lock()
+	ackedViewnum := pb.activeView.Viewnum
+	vs := pb.vs
+	pb.mu.Unlock()
 
-	// Your code here.
+	nextView, err := vs.Ping(ackedViewnum)
+	if err != nil {
+		return
+	}
+
+	if ackedViewnum < nextView.Viewnum {
+		pb.mu.Lock()
+		pb.activeView = nextView
+		pb.mayBecomePrimary()
+		pb.mayBecomeBackup()
+		pb.mu.Unlock()
+	}
+}
+
+func (pb *PBServer) mayBecomePrimary() {
+	if pb.me == pb.activeView.Primary {
+		if pb.activeView.Backup != "" {
+			pb.pr = MakeInterServerClerk(pb.activeView.Backup)
+			pb.syncData()
+		}
+	}
+}
+
+func (pb *PBServer) mayBecomeBackup() {
+	if pb.me == pb.activeView.Backup {
+		pb.pr = nil
+	}
+}
+
+func (pb *PBServer) syncData() {
+	data := make(map[string]string)
+	for k, v := range pb.data {
+		data[k] = v
+	}
+	pb.pr.Sync(pb.activeView.Viewnum, data)
 }
 
 // tell the server to shut itself down.
@@ -78,12 +234,14 @@ func (pb *PBServer) isunreliable() bool {
 	return atomic.LoadInt32(&pb.unreliable) != 0
 }
 
-
 func StartServer(vshost string, me string) *PBServer {
 	pb := new(PBServer)
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
-	// Your pb.* initializations here.
+	pb.activeView = viewservice.View{Viewnum: 0}
+	pb.data = make(map[string]string)
+	pb.highestHandledRequestIDByClerkID = make(map[int64]int64)
+	pb.pr = nil
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
@@ -99,9 +257,9 @@ func StartServer(vshost string, me string) *PBServer {
 	// or do anything to subvert it.
 
 	go func() {
-		for pb.isdead() == false {
+		for !pb.isdead() {
 			conn, err := pb.l.Accept()
-			if err == nil && pb.isdead() == false {
+			if err == nil && !pb.isdead() {
 				if pb.isunreliable() && (rand.Int63()%1000) < 100 {
 					// discard the request.
 					conn.Close()
@@ -120,7 +278,7 @@ func StartServer(vshost string, me string) *PBServer {
 			} else if err == nil {
 				conn.Close()
 			}
-			if err != nil && pb.isdead() == false {
+			if err != nil && !pb.isdead() {
 				fmt.Printf("PBServer(%v) accept: %v\n", me, err.Error())
 				pb.kill()
 			}
@@ -128,7 +286,7 @@ func StartServer(vshost string, me string) *PBServer {
 	}()
 
 	go func() {
-		for pb.isdead() == false {
+		for !pb.isdead() {
 			pb.tick()
 			time.Sleep(viewservice.PingInterval)
 		}

@@ -1,21 +1,25 @@
 package pbservice
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongServer = "ErrWrongServer"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongServer  = "ErrWrongServer"
+	ErrWrongViewnum = "ErrWrongViewnum"
+	Put             = "Put"
+	Append          = "Append"
 )
 
 type Err string
+type Op string
 
 // Put or Append
 type PutAppendArgs struct {
-	Key   string
-	Value string
-	// You'll have to add definitions here.
-
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Viewnum   uint
+	Op        Op
+	Key       string
+	Value     string
+	ClerkID   int64
+	RequestID int64
 }
 
 type PutAppendReply struct {
@@ -23,8 +27,10 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	Viewnum   uint
+	Key       string
+	ClerkID   int64
+	RequestID int64
 }
 
 type GetReply struct {
@@ -32,5 +38,12 @@ type GetReply struct {
 	Value string
 }
 
+type SyncArgs struct {
+	Viewnum                          uint
+	Data                             map[string]string
+	HighestHandledRequestIDByClerkID map[int64]int64
+}
 
-// Your RPC definitions here.
+type SyncReply struct {
+	Err Err
+}
