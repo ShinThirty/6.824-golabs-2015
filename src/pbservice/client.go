@@ -3,7 +3,6 @@ package pbservice
 import (
 	"crypto/rand"
 	"fmt"
-	"log"
 	"math/big"
 	"net/rpc"
 	"sync"
@@ -137,10 +136,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 }
 
 // primary forward putappend requests to backup
+func (ck *Clerk) ForwardGet(args *GetArgs) *GetReply {
+	var reply GetReply
+
+	ok := call(ck.peer, "PBServer.ForwardGet", &args, &reply)
+	if !ok {
+		reply.Err = ErrWrongViewnum
+	}
+
+	return &reply
+}
+
+// primary forward putappend requests to backup
 func (ck *Clerk) ForwardPutAppend(args *PutAppendArgs) *PutAppendReply {
 	var reply PutAppendReply
 
-	log.Printf("Forwarding PutAppend %v to %v", *args, ck.peer)
 	ok := call(ck.peer, "PBServer.ForwardPutAppend", &args, &reply)
 	if !ok {
 		reply.Err = ErrWrongViewnum
@@ -180,7 +190,6 @@ func (ck *Clerk) updateView() {
 	for {
 		view, ok := ck.vs.Get()
 		if ok {
-			log.Printf("New view: %v", view)
 			ck.view = view
 			return
 		} else {

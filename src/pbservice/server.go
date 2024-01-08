@@ -43,6 +43,12 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
+	err := pb.mayForwardGet(args)
+	if err != OK {
+		reply.Err = err
+		return nil
+	}
+
 	value, ok := pb.data[args.Key]
 	if !ok {
 		reply.Err = ErrNoKey
@@ -54,6 +60,33 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	return nil
 }
 
+func (pb *PBServer) ForwardGet(args *GetArgs, reply *GetReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if args.Viewnum != pb.activeView.Viewnum {
+		reply.Err = ErrWrongViewnum
+		return nil
+	}
+
+	if pb.me != pb.activeView.Backup {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	reply.Err = OK
+	return nil
+}
+
+func (pb *PBServer) mayForwardGet(args *GetArgs) Err {
+	if pb.pr == nil {
+		return OK
+	} else {
+		reply := pb.pr.ForwardGet(args)
+		return reply.Err
+	}
+}
+
 func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
@@ -63,7 +96,6 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 		return nil
 	}
 
-	log.Printf("Args %v, activeView: %v", *args, pb.activeView)
 	if args.Viewnum != pb.activeView.Viewnum {
 		reply.Err = ErrWrongViewnum
 		return nil
@@ -87,7 +119,6 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 }
 
 func (pb *PBServer) doPutAppend(args *PutAppendArgs) {
-	log.Printf("Do PutAppend: %v", *args)
 	switch args.Op {
 	case Put:
 		pb.data[args.Key] = args.Value
@@ -104,7 +135,6 @@ func (pb *PBServer) ForwardPutAppend(args *PutAppendArgs, reply *PutAppendReply)
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	log.Printf("Received forwarded PutAppend %v", *args)
 	if args.RequestID <= pb.highestHandledRequestIDByClerkID[args.ClerkID] {
 		reply.Err = OK
 		return nil
