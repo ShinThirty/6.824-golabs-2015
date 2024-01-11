@@ -24,7 +24,7 @@ type PBServer struct {
 	vs         *viewservice.Clerk
 
 	activeView                       viewservice.View
-	data                             map[string]string
+	data                             map[string]Value
 	highestHandledRequestIDByClerkID map[int64]int64
 	pr                               *Clerk // Primary will use this clerk to sync data and forward requests to the backup
 }
@@ -55,7 +55,7 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
-	reply.Value = value
+	reply.Value = value.Value
 	reply.Err = OK
 	return nil
 }
@@ -106,7 +106,11 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 		return nil
 	}
 
-	err := pb.mayForwardPutAppend(args)
+	oldValue, ok := pb.data[args.Key]
+	if !ok {
+		oldValue = Value{Version: 0, Value: ""}
+	}
+	err := pb.mayForwardPutAppend(args, oldValue.Version)
 	if err != OK {
 		reply.Err = err
 		return nil
@@ -119,28 +123,30 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 }
 
 func (pb *PBServer) doPutAppend(args *PutAppendArgs) {
+	oldValue, ok := pb.data[args.Key]
+	if !ok {
+		oldValue = Value{Version: 0, Value: ""}
+	}
+	newValue := Value{Version: oldValue.Version + 1}
 	switch args.Op {
 	case Put:
-		pb.data[args.Key] = args.Value
+		newValue.Value = args.Value
 	case Append:
-		oldValue, ok := pb.data[args.Key]
-		if !ok {
-			oldValue = ""
-		}
-		pb.data[args.Key] = oldValue + args.Value
+		newValue.Value = oldValue.Value + args.Value
 	}
+	pb.data[args.Key] = newValue
 }
 
-func (pb *PBServer) ForwardPutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+func (pb *PBServer) ForwardPutAppend(args *ForwardPutAppendArgs, reply *ForwardPutAppendReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	if args.RequestID <= pb.highestHandledRequestIDByClerkID[args.ClerkID] {
+	if args.Args.RequestID <= pb.highestHandledRequestIDByClerkID[args.Args.ClerkID] {
 		reply.Err = OK
 		return nil
 	}
 
-	if args.Viewnum != pb.activeView.Viewnum {
+	if args.Args.Viewnum != pb.activeView.Viewnum {
 		reply.Err = ErrWrongViewnum
 		return nil
 	}
@@ -150,17 +156,26 @@ func (pb *PBServer) ForwardPutAppend(args *PutAppendArgs, reply *PutAppendReply)
 		return nil
 	}
 
-	pb.doPutAppend(args)
-	pb.highestHandledRequestIDByClerkID[args.ClerkID] = args.RequestID
+	oldValue, ok := pb.data[args.Args.Key]
+	if !ok {
+		oldValue = Value{Version: 0, Value: ""}
+	}
+	if args.PrimaryVersion < oldValue.Version {
+		reply.Err = ErrWrongVersion
+		return nil
+	}
+
+	pb.doPutAppend(&args.Args)
+	pb.highestHandledRequestIDByClerkID[args.Args.ClerkID] = args.Args.RequestID
 	reply.Err = OK
 	return nil
 }
 
-func (pb *PBServer) mayForwardPutAppend(args *PutAppendArgs) Err {
+func (pb *PBServer) mayForwardPutAppend(args *PutAppendArgs, primaryVersion int64) Err {
 	if pb.pr == nil {
 		return OK
 	} else {
-		reply := pb.pr.ForwardPutAppend(args)
+		reply := pb.pr.ForwardPutAppend(args, primaryVersion)
 		return reply.Err
 	}
 }
@@ -232,11 +247,15 @@ func (pb *PBServer) mayBecomeBackup() {
 }
 
 func (pb *PBServer) syncData() {
-	data := make(map[string]string)
+	data := make(map[string]Value)
 	for k, v := range pb.data {
 		data[k] = v
 	}
-	pb.pr.Sync(pb.activeView.Viewnum, data)
+	highestHandledRequestIDByClerkID := make(map[int64]int64)
+	for k, v := range pb.highestHandledRequestIDByClerkID {
+		highestHandledRequestIDByClerkID[k] = v
+	}
+	pb.pr.Sync(pb.activeView.Viewnum, data, highestHandledRequestIDByClerkID)
 }
 
 // tell the server to shut itself down.
@@ -269,7 +288,7 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	pb.activeView = viewservice.View{Viewnum: 0}
-	pb.data = make(map[string]string)
+	pb.data = make(map[string]Value)
 	pb.highestHandledRequestIDByClerkID = make(map[int64]int64)
 	pb.pr = nil
 

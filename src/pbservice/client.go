@@ -148,15 +148,17 @@ func (ck *Clerk) ForwardGet(args *GetArgs) *GetReply {
 }
 
 // primary forward putappend requests to backup
-func (ck *Clerk) ForwardPutAppend(args *PutAppendArgs) *PutAppendReply {
-	var reply PutAppendReply
+func (ck *Clerk) ForwardPutAppend(args *PutAppendArgs, primaryVersion int64) *ForwardPutAppendReply {
+	var forwardReply ForwardPutAppendReply
 
-	ok := call(ck.peer, "PBServer.ForwardPutAppend", &args, &reply)
+	forwardArgs := ForwardPutAppendArgs{Args: *args, PrimaryVersion: primaryVersion}
+
+	ok := call(ck.peer, "PBServer.ForwardPutAppend", &forwardArgs, &forwardReply)
 	if !ok {
-		reply.Err = ErrWrongViewnum
+		forwardReply.Err = ErrWrongViewnum
 	}
 
-	return &reply
+	return &forwardReply
 }
 
 // tell the primary to update key's value.
@@ -172,8 +174,8 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 // send the entire database to another peer, keeps trying until succeeded
-func (ck *Clerk) Sync(viewnum uint, data map[string]string) {
-	args := SyncArgs{Viewnum: viewnum, Data: data}
+func (ck *Clerk) Sync(viewnum uint, data map[string]Value, highestHandledRequestIDByClerkID map[int64]int64) {
+	args := SyncArgs{Viewnum: viewnum, Data: data, HighestHandledRequestIDByClerkID: highestHandledRequestIDByClerkID}
 
 	for {
 		var reply SyncReply

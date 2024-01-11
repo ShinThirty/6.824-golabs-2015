@@ -5,12 +5,18 @@ const (
 	ErrNoKey        = "ErrNoKey"
 	ErrWrongServer  = "ErrWrongServer"
 	ErrWrongViewnum = "ErrWrongViewnum"
+	ErrWrongVersion = "ErrWrongVersion"
 	Put             = "Put"
 	Append          = "Append"
 )
 
 type Err string
 type Op string
+
+type Value struct {
+	Version int64 // version number that is incremented everytime the value is changed
+	Value   string
+}
 
 // Put or Append
 type PutAppendArgs struct {
@@ -23,6 +29,15 @@ type PutAppendArgs struct {
 }
 
 type PutAppendReply struct {
+	Err Err
+}
+
+type ForwardPutAppendArgs struct {
+	Args           PutAppendArgs
+	PrimaryVersion int64 // current value version in the primary to bound the version difference between primary and backup to 1
+}
+
+type ForwardPutAppendReply struct {
 	Err Err
 }
 
@@ -40,7 +55,7 @@ type GetReply struct {
 
 type SyncArgs struct {
 	Viewnum                          uint
-	Data                             map[string]string
+	Data                             map[string]Value
 	HighestHandledRequestIDByClerkID map[int64]int64
 }
 
